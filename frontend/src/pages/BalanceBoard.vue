@@ -14,7 +14,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import { useImbalanceRank, type ImbalanceRow } from '@/hooks/useImbalanceRank'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
-import { useAdjustStore } from '@/stores/adjustStore'
+import { useAdjustStore, ReviewBlockedError } from '@/stores/adjustStore'
 import { IMBALANCE_BALANCED, IMBALANCE_WARN, basisText, formatFlow, formatOpening } from '@/utils/balance'
 import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
 import { exportBalanceCsv } from '@/utils/export'
@@ -130,9 +130,14 @@ function openAdjustEdit(row: ImbalanceRow): void {
 async function submitAdjust(): Promise<void> {
   const adjust = adjustStore.adjusts.find((item) => item.valveId === adjustForm.valveId)
   if (!adjust) return
-  await adjustStore.updateAdjust(adjust.id, { ...adjustForm })
-  MessagePlugin.success('调节单已更新')
-  adjustDialogVisible.value = false
+  try {
+    await adjustStore.updateAdjust(adjust.id, { ...adjustForm })
+    MessagePlugin.success('调节单已更新')
+    adjustDialogVisible.value = false
+  } catch (error) {
+    if (error instanceof ReviewBlockedError) MessagePlugin.warning(error.message)
+    else MessagePlugin.error('调节单更新失败')
+  }
 }
 
 function removeAdjust(row: ImbalanceRow): void {

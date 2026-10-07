@@ -5,6 +5,7 @@
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
+import type { AdjustReadingSnapshot } from '@/types/adjust'
 import { ROOM_TARGET_C } from '@/types/measure'
 
 /** 平衡判定阈值：失衡度 ≤ 10% 视为平衡 */
@@ -135,4 +136,68 @@ export function formatImbalance(value: number): string {
 export function measureHint(measure: Pick<Measure, 'flowM3h' | 'roomTempC'>, designFlowM3h: number): string {
   const value = imbalance(measure.flowM3h, designFlowM3h, measure.roomTempC)
   return `失衡度约 ${value.toFixed(1)}%`
+}
+
+/* ======================= 调节单「基准 / 复测」两次口径 ======================= */
+
+/** 执行时刻（毫秒时间戳）对应的本地日期 YYYY-MM-DD */
+export function dayOfTimestamp(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10)
+}
+
+/**
+ * 基准口径候选：执行时间之前（含执行当日）最近的一次实测。
+ * 日期相等时再用实测创建时间兜底，避免执行当天补录的读数被当成执行前旧读数。
+ */
+export function measureForBaseline(measures: Measure[], executedAt: number): Measure | null {
+  const execDay = dayOfTimestamp(executedAt)
+  return (
+    measures
+      .filter((item) => item.date < execDay || (item.date === execDay && item.createdAt <= executedAt))
+      .sort((a, b) => (a.date === b.date ? b.createdAt - a.createdAt : a.date < b.date ? 1 : -1))[0] ??
+    null
+  )
+}
+
+/**
+ * 复测口径候选：执行时间之后最新的一次实测；没有新测次返回 null（复核必须被挡住）。
+ * 执行当天录入的读数按实测创建时间严格晚于执行时刻计算，防止旧读数冒充复测结果。
+ */
+export function measureForReview(measures: Measure[], executedAt: number): Measure | null {
+  const execDay = dayOfTimestamp(executedAt)
+  return (
+    measures
+      .filter((item) => item.date > execDay || (item.date === execDay && item.createdAt > executedAt))
+      .sort((a, b) => (a.date === b.date ? b.createdAt - a.createdAt : a.date < b.date ? 1 : -1))[0] ??
+    null
+  )
+}
+
+/** 由一次实测读数固化口径快照（执行基准与复测共用） */
+export function buildAdjustReading(
+  measure: Measure,
+  opening: number,
+  designFlowM3h: number
+): AdjustReadingSnapshot {
+  return {
+    measureDate: measure.date,
+    opening: clampLikeOpening(opening),
+    flowM3h: measure.flowM3h,
+    roomTempC: measure.roomTempC,
+    designFlowM3h,
+    ratio: flowRatio(measure.flowM3h, designFlowM3h),
+    flowDeviation: flowDeviationPct(measure.flowM3h, designFlowM3h),
+    roomDeviation: roomDeviationC(measure.roomTempC),
+    imbalanceValue: imbalance(measure.flowM3h, designFlowM3h, measure.roomTempC),
+    level: balanceLevel(
+      imbalance(measure.flowM3h, designFlowM3h, measure.roomTempC),
+      measure.flowM3h,
+      designFlowM3h
+    )
+  }
+}
+
+function clampLikeOpening(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.min(100, Math.max(0, Math.round(value)))
 }

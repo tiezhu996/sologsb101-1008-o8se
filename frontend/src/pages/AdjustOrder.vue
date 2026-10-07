@@ -3,26 +3,29 @@
  * /adjusts 调节单下发与复核
  * 生成目标开度、执行回填、复核确认并导出全量 JSON。
  * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
+ *
+ * 两次口径：执行时固化开度与当时流量、室温（基准）；复核只认执行时间之后的新测次（复测），
+ * 没有新测次时复核被挡住，防止旧读数冒充复测结果。
  */
-import { computed, reactive, ref, watchEffect } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import BalanceTag from '@/components/common/BalanceTag.vue'
-import { useAdjustStore, type AdjustEnriched } from '@/stores/adjustStore'
+import { useAdjustStore, ReviewBlockedError, type AdjustEnriched } from '@/stores/adjustStore'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
-import { useImbalanceRank } from '@/hooks/useImbalanceRank'
 import {
   ADJUST_STATES,
   ADJUST_STATE_FLOW,
   EMPTY_ADJUST_DRAFT,
   type Adjust,
   type AdjustDraft,
+  type AdjustReadingSnapshot,
   type AdjustState
 } from '@/types/adjust'
-import { basisText, formatOpening } from '@/utils/balance'
+import { formatOpening } from '@/utils/balance'
 import { exportAdjustCsv } from '@/utils/export'
 import {
   DB_VERSION,
@@ -42,18 +45,6 @@ type FilterModel = { keyword: string; [key: string]: string | string[] | boolean
 const adjustStore = useAdjustStore()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
-const rank = useImbalanceRank()
-
-// 把最新实测快照灌入调节单 store，用于重算失衡度
-watchEffect(() => {
-  adjustStore.syncLatestMeasures(
-    rank.rows.value.map((row) => ({
-      valve: row.valve,
-      measured: row.measured,
-      latest: row.latest ? { roomTempC: row.latest.roomTempC, date: row.latest.date } : null
-    }))
-  )
-})
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(readLastBackupAt())
@@ -87,13 +78,14 @@ function onFilterChange(model: FilterModel): void {
 const rows = computed(() => adjustStore.filtered)
 
 const columns = [
-  { colKey: 'valve', title: '阀门 / 楼栋', width: 200, cell: 'valveCell' },
-  { colKey: 'imbalance', title: '失衡度', width: 150, cell: 'imbalanceCell' },
-  { colKey: 'opening', title: '当前 → 目标开度', width: 170, cell: 'openingCell' },
-  { colKey: 'basis', title: '调节依据', minWidth: 260, cell: 'basisCell' },
-  { colKey: 'executor', title: '执行人', width: 110 },
-  { colKey: 'state', title: '状态', width: 110, cell: 'stateCell' },
-  { colKey: 'note', title: '复核意见', width: 180, cell: 'noteCell' },
+  { colKey: 'valve', title: '阀门 / 楼栋', width: 190, cell: 'valveCell' },
+  { colKey: 'baseline', title: '执行基准（执行时快照）', minWidth: 210, cell: 'baselineCell' },
+  { colKey: 'review', title: '执行后复测', minWidth: 210, cell: 'reviewCell' },
+  { colKey: 'opening', title: '当前 → 目标开度', width: 160, cell: 'openingCell' },
+  { colKey: 'basis', title: '调节依据', minWidth: 240, cell: 'basisCell' },
+  { colKey: 'executor', title: '执行人', width: 100 },
+  { colKey: 'state', title: '状态', width: 100, cell: 'stateCell' },
+  { colKey: 'note', title: '复核意见', width: 170, cell: 'noteCell' },
   { colKey: 'op', title: '操作', width: 250, cell: 'opCell' }
 ]
 
@@ -124,12 +116,11 @@ const valveOptions = computed(() =>
 function openCreate(): void {
   editingId = null
   dialogTitle.value = '新建调节单'
-  const first = rank.rows.value.find((row) => row.level !== '平衡')
   Object.assign(form, {
     ...EMPTY_ADJUST_DRAFT,
-    valveId: first ? first.valve.id : valveOptions.value[0]?.value ?? '',
-    targetOpening: first ? first.suggestOpening : 50,
-    basis: first ? describeRow(first.valve.id) : ''
+    valveId: valveOptions.value[0]?.value ?? '',
+    targetOpening: 50,
+    basis: ''
   })
   dialogVisible.value = true
 }
@@ -148,20 +139,6 @@ function openEdit(row: AdjustEnriched): void {
   dialogVisible.value = true
 }
 
-function describeRow(valveId: string): string {
-  const row = rank.rowOf(valveId)
-  if (!row) return ''
-  return basisText({
-    valve: row.valve,
-    building: row.building,
-    ratio: row.ratio,
-    flowDeviation: row.flowDeviation,
-    roomDeviation: row.roomDeviation,
-    imbalanceValue: row.imbalanceValue,
-    level: row.level
-  })
-}
-
 async function submit(): Promise<void> {
   try {
     const result = await formRef.value?.validate()
@@ -169,15 +146,23 @@ async function submit(): Promise<void> {
   } catch {
     return
   }
-  if (editingId) {
-    await adjustStore.updateAdjust(editingId, { ...form })
-    MessagePlugin.success('调节单已更新')
-  } else {
-    await adjustStore.createAdjust({ ...form })
-    MessagePlugin.success('调节单已创建')
+  try {
+    if (editingId) {
+      await adjustStore.updateAdjust(editingId, { ...form })
+      MessagePlugin.success('调节单已更新')
+    } else {
+      await adjustStore.createAdjust({ ...form })
+      MessagePlugin.success('调节单已创建')
+    }
+    dialogVisible.value = false
+    await refreshCounts()
+  } catch (error) {
+    if (error instanceof ReviewBlockedError) {
+      MessagePlugin.warning(error.message)
+    } else {
+      MessagePlugin.error('保存失败，请重试')
+    }
   }
-  dialogVisible.value = false
-  await refreshCounts()
 }
 
 function remove(adjust: Adjust): void {
@@ -219,7 +204,7 @@ async function advance(row: AdjustEnriched): Promise<void> {
     return
   }
   await adjustStore.advance(row.adjust.id)
-  MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
+  MessagePlugin.success(`已执行：开度回写到阀门台账，并固化执行时流量/室温基准快照`)
   await refreshCounts()
 }
 
@@ -229,20 +214,61 @@ const reviewVisible = ref(false)
 const reviewNote = ref('')
 const reviewTargetId = ref<string | null>(null)
 const reviewTargetLabel = ref('')
+const reviewTargetRow = ref<AdjustEnriched | null>(null)
 
 function openReview(row: AdjustEnriched): void {
+  if (!row.reviewReady || !row.reviewCandidate) {
+    // 没有执行后的新测次：挡住，不允许用执行前旧读数复核
+    MessagePlugin.warning('执行后还没有新的实测测次，请先到「实测录入」登记复测读数，再复核闭环')
+    return
+  }
   reviewTargetId.value = row.adjust.id
+  reviewTargetRow.value = row
   reviewTargetLabel.value = row.valve ? row.valve.code : ''
-  reviewNote.value = row.adjust.reviewNote || '复核后流量比恢复至 0.95 以上，室温达标，同意闭环'
+  reviewNote.value =
+    row.adjust.reviewNote ||
+    `已按 ${row.reviewCandidate.measureDate} 复测：流量比 ${row.reviewCandidate.ratio.toFixed(2)}、` +
+      `室温 ${row.reviewCandidate.roomTempC.toFixed(1)}℃、失衡度 ${row.reviewCandidate.imbalanceValue.toFixed(1)}%，同意闭环`
   reviewVisible.value = true
 }
 
 async function submitReview(): Promise<void> {
   if (!reviewTargetId.value) return
-  await adjustStore.review(reviewTargetId.value, reviewNote.value)
-  MessagePlugin.success('复核完成，调节单已闭环')
-  reviewVisible.value = false
-  await refreshCounts()
+  try {
+    await adjustStore.review(reviewTargetId.value, reviewNote.value)
+    MessagePlugin.success('复核完成，复测读数已固化，调节单闭环')
+    reviewVisible.value = false
+    await refreshCounts()
+  } catch (error) {
+    if (error instanceof ReviewBlockedError) {
+      MessagePlugin.warning(error.message)
+      reviewVisible.value = false
+    } else {
+      MessagePlugin.error('复核失败，请重试')
+    }
+  }
+}
+
+/* ---------------------------- 状态详情 ---------------------------- */
+
+const detailVisible = ref(false)
+const detailRow = ref<AdjustEnriched | null>(null)
+
+function openDetail(row: AdjustEnriched): void {
+  detailRow.value = row
+  detailVisible.value = true
+}
+
+function formatDateTime(value: number | null | undefined): string {
+  if (typeof value !== 'number') return '—'
+  const date = new Date(value)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function snapshotText(snapshot: AdjustReadingSnapshot | null): string {
+  if (!snapshot) return '—'
+  return `${snapshot.measureDate} · 流量 ${snapshot.flowM3h.toFixed(1)} / 室温 ${snapshot.roomTempC.toFixed(1)}℃ · 比 ${snapshot.ratio.toFixed(2)} · 失衡 ${snapshot.imbalanceValue.toFixed(1)}%`
 }
 
 /* ---------------------------- 备份导出 ---------------------------- */
@@ -252,7 +278,7 @@ function exportCsv(): void {
     stationStore.stations,
     stationStore.buildings,
     valveStore.valves,
-    rank.measureTable.rows.value,
+    adjustStore.measureTable.rows,
     adjustStore.adjusts
   )
   MessagePlugin.success(`已导出 ${filename}`)
@@ -293,7 +319,7 @@ async function onFileChange(event: Event): Promise<void> {
       return
     }
     await importSnapshot(payload)
-    MessagePlugin.success('存档已导入')
+    MessagePlugin.success('存档已导入（含执行基准 / 复测两次口径快照）')
     await refreshCounts()
   } catch (error) {
     MessagePlugin.error(`导入失败：${error instanceof Error ? error.message : '未知错误'}`)
@@ -339,7 +365,8 @@ function clearData(): void {
       <div>
         <h2 class="page-head__title">调节单下发与复核</h2>
         <p class="page-head__desc">
-          调节单状态机：待下发 → 已调节（回写阀门开度）→ 已复核（记录复核意见）。
+          执行（待下发 → 已调节）时固化开度与当时流量、室温作为基准；复核只认执行时间之后的新测次，
+          无新测次一律挡住，旧读数不能冒充复测结果。
         </p>
       </div>
       <div class="page-head__actions">
@@ -367,7 +394,7 @@ function clearData(): void {
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
         <h3 class="panel-title" style="margin: 0">调节单（{{ rows.length }} / {{ adjustStore.adjusts.length }}）</h3>
-        <span class="muted">执行人未指派时可先下发，执行后回填</span>
+        <span class="muted">基准＝执行时快照；复测＝执行后最新测次，无新测次不可复核</span>
       </div>
 
       <EmptyPanel
@@ -392,8 +419,34 @@ function clearData(): void {
             </div>
           </div>
         </template>
-        <template #imbalanceCell="{ row }">
-          <BalanceTag v-if="row.valve" :level="row.level" :imbalance="row.imbalanceValue" size="small" />
+        <template #baselineCell="{ row }">
+          <template v-if="row.baseline">
+            <BalanceTag :level="row.baseline.level" :imbalance="row.baseline.imbalanceValue" size="small" />
+            <div class="muted caliber-line">{{ snapshotText(row.baseline) }}</div>
+            <div class="muted caliber-line">基准开度 {{ formatOpening(row.baseline.opening) }} · {{ formatDateTime(row.adjust.executedAt) }}</div>
+          </template>
+          <BalanceTag v-else-if="row.adjust.state === '待下发' && row.valve" :level="row.previewLevel" :imbalance="row.previewValue" size="small" />
+          <span v-else class="muted">执行时无实测读数</span>
+        </template>
+        <template #reviewCell="{ row }">
+          <template v-if="row.review">
+            <BalanceTag :level="row.review.level" :imbalance="row.review.imbalanceValue" size="small" />
+            <div class="muted caliber-line">{{ snapshotText(row.review) }}</div>
+            <div class="muted caliber-line">复测开度 {{ formatOpening(row.review.opening) }} · {{ formatDateTime(row.adjust.reviewedAt) }}</div>
+          </template>
+          <template v-else-if="row.adjust.state === '已调节'">
+            <template v-if="row.reviewCandidate">
+              <BalanceTag :level="row.reviewCandidate.level" :imbalance="row.reviewCandidate.imbalanceValue" size="small" />
+              <div class="muted caliber-line">{{ snapshotText(row.reviewCandidate) }}</div>
+              <div class="muted caliber-line is-ready">已有执行后新测次，可复核</div>
+            </template>
+            <t-alert
+              theme="warning"
+              message="执行后无新测次"
+              description="请先录入执行日期之后的复测读数"
+              size="small"
+            />
+          </template>
           <span v-else class="muted">—</span>
         </template>
         <template #openingCell="{ row }">
@@ -418,6 +471,16 @@ function clearData(): void {
         <template #opCell="{ row }">
           <div class="toolbar">
             <t-button
+              v-if="row.adjust.state === '已调节' && !row.reviewReady"
+              size="small"
+              variant="text"
+              theme="warning"
+              disabled
+            >
+              待复测（新测次）
+            </t-button>
+            <t-button
+              v-else
               size="small"
               variant="text"
               theme="primary"
@@ -426,6 +489,7 @@ function clearData(): void {
             >
               {{ nextStateLabel(row.adjust.state as AdjustState) }}
             </t-button>
+            <t-button size="small" variant="text" theme="primary" @click="openDetail(row)">状态详情</t-button>
             <t-button size="small" variant="text" theme="primary" @click="openEdit(row)">编辑</t-button>
             <t-button size="small" variant="text" theme="danger" @click="remove(row.adjust)">删除</t-button>
           </div>
@@ -488,18 +552,151 @@ function clearData(): void {
           <t-input v-model="form.reviewNote" placeholder="复核合格可留空" />
         </t-form-item>
       </t-form>
+      <t-alert
+        v-if="form.state !== '待下发'"
+        theme="warning"
+        message="手工切换到「已调节 / 已复核」同样受两次口径约束：执行固化基准快照，复核必须存在执行后的新测次。"
+      />
     </t-dialog>
 
     <t-dialog
       v-model:visible="reviewVisible"
       :header="`复核闭环 · ${reviewTargetLabel}`"
-      width="520px"
+      width="560px"
       :confirm-btn="'确认闭环'"
       :cancel-btn="'取消'"
       @confirm="submitReview"
     >
+      <template v-if="reviewTargetRow">
+        <t-descriptions :column="1" bordered size="small" style="margin-bottom: 12px">
+          <t-descriptions-item label="执行基准">
+            <BalanceTag
+              v-if="reviewTargetRow.baseline"
+              :level="reviewTargetRow.baseline.level"
+              :imbalance="reviewTargetRow.baseline.imbalanceValue"
+              size="small"
+            />
+            <span class="muted">{{ snapshotText(reviewTargetRow.baseline) }}</span>
+          </t-descriptions-item>
+          <t-descriptions-item label="执行后复测">
+            <BalanceTag
+              v-if="reviewTargetRow.reviewCandidate"
+              :level="reviewTargetRow.reviewCandidate.level"
+              :imbalance="reviewTargetRow.reviewCandidate.imbalanceValue"
+              size="small"
+            />
+            <span class="muted">{{ snapshotText(reviewTargetRow.reviewCandidate) }}</span>
+          </t-descriptions-item>
+        </t-descriptions>
+      </template>
       <t-textarea v-model="reviewNote" :autosize="{ minRows: 3, maxRows: 6 }" placeholder="填写复核结论" />
-      <p class="muted">复核后调节单状态置为「已复核」，并保留复核意见。</p>
+      <p class="muted">复测只采用执行时间之后的新测次；确认后复测读数固化进调节单，页面重开仍保留两次口径。</p>
+    </t-dialog>
+
+    <t-dialog
+      v-model:visible="detailVisible"
+      :header="`状态详情 · ${detailRow?.valve ? detailRow.valve.code : ''}`"
+      width="640px"
+      :confirm-btn="null"
+      cancel-btn="关闭"
+    >
+      <template v-if="detailRow">
+        <t-descriptions :column="2" bordered size="small">
+          <t-descriptions-item label="当前状态">{{ detailRow.adjust.state }}</t-descriptions-item>
+          <t-descriptions-item label="执行人">{{ detailRow.adjust.executor }}</t-descriptions-item>
+          <t-descriptions-item label="当前开度 → 目标开度">
+            {{ detailRow.valve ? formatOpening(detailRow.valve.currentOpening) : '—' }}
+            → {{ formatOpening(detailRow.adjust.targetOpening) }}
+          </t-descriptions-item>
+          <t-descriptions-item label="执行时间">{{ formatDateTime(detailRow.adjust.executedAt) }}</t-descriptions-item>
+          <t-descriptions-item label="复核时间">{{ formatDateTime(detailRow.adjust.reviewedAt) }}</t-descriptions-item>
+        </t-descriptions>
+
+        <h4 class="detail-subtitle">执行基准（执行时快照）</h4>
+        <t-descriptions v-if="detailRow.baseline" :column="2" bordered size="small">
+          <t-descriptions-item label="基准开度">{{ formatOpening(detailRow.baseline.opening) }}</t-descriptions-item>
+          <t-descriptions-item label="基准实测日期">{{ detailRow.baseline.measureDate }}</t-descriptions-item>
+          <t-descriptions-item label="基准流量">{{ detailRow.baseline.flowM3h.toFixed(1) }} m³/h</t-descriptions-item>
+          <t-descriptions-item label="基准室温">{{ detailRow.baseline.roomTempC.toFixed(1) }} ℃</t-descriptions-item>
+          <t-descriptions-item label="基准流量比">{{ detailRow.baseline.ratio.toFixed(2) }}</t-descriptions-item>
+          <t-descriptions-item label="基准流量偏差">{{ detailRow.baseline.flowDeviation.toFixed(1) }}%</t-descriptions-item>
+          <t-descriptions-item label="基准室温偏差">{{ detailRow.baseline.roomDeviation.toFixed(1) }}℃</t-descriptions-item>
+          <t-descriptions-item label="基准失衡度 / 判级">
+            <BalanceTag :level="detailRow.baseline.level" :imbalance="detailRow.baseline.imbalanceValue" size="small" />
+          </t-descriptions-item>
+        </t-descriptions>
+        <p v-else class="muted">
+          {{ detailRow.adjust.state === '待下发' ? '尚未执行，执行时记录基准。' : '执行时该阀门没有可用实测读数。' }}
+        </p>
+
+        <h4 class="detail-subtitle">执行后复测（仅认执行时间之后的新测次）</h4>
+        <t-descriptions
+          v-if="detailRow.review ?? detailRow.reviewCandidate"
+          :column="2"
+          bordered
+          size="small"
+        >
+          <t-descriptions-item label="复测开度">
+            {{ formatOpening((detailRow.review ?? detailRow.reviewCandidate)!.opening) }}
+          </t-descriptions-item>
+          <t-descriptions-item label="复测实测日期">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.measureDate }}
+          </t-descriptions-item>
+          <t-descriptions-item label="复测流量">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.flowM3h.toFixed(1) }} m³/h
+          </t-descriptions-item>
+          <t-descriptions-item label="复测室温">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.roomTempC.toFixed(1) }} ℃
+          </t-descriptions-item>
+          <t-descriptions-item label="复测流量比">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.ratio.toFixed(2) }}
+          </t-descriptions-item>
+          <t-descriptions-item label="复测流量偏差">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.flowDeviation.toFixed(1) }}%
+          </t-descriptions-item>
+          <t-descriptions-item label="复测室温偏差">
+            {{ (detailRow.review ?? detailRow.reviewCandidate)!.roomDeviation.toFixed(1) }}℃
+          </t-descriptions-item>
+          <t-descriptions-item label="复测失衡度 / 判级">
+            <BalanceTag
+              :level="(detailRow.review ?? detailRow.reviewCandidate)!.level"
+              :imbalance="(detailRow.review ?? detailRow.reviewCandidate)!.imbalanceValue"
+              size="small"
+            />
+          </t-descriptions-item>
+        </t-descriptions>
+        <t-alert
+          v-else-if="detailRow.adjust.state === '已调节'"
+          theme="warning"
+          message="执行后暂无新测次，复核已被挡住"
+          description="请先在实测录入页登记执行日期之后的复测读数。"
+        />
+        <p v-else class="muted">—</p>
+
+        <h4 class="detail-subtitle">调节依据与复核意见</h4>
+        <t-descriptions :column="1" bordered size="small">
+          <t-descriptions-item label="调节依据">{{ detailRow.adjust.basis || '—' }}</t-descriptions-item>
+          <t-descriptions-item label="复核意见">{{ detailRow.adjust.reviewNote || '—' }}</t-descriptions-item>
+        </t-descriptions>
+      </template>
     </t-dialog>
   </div>
 </template>
+
+<style scoped>
+.caliber-line {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.caliber-line.is-ready {
+  color: #b45309;
+}
+
+.detail-subtitle {
+  margin: 16px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+</style>

@@ -5,8 +5,8 @@ import type { Station } from '@/types/station'
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
-import type { Adjust } from '@/types/adjust'
-import { imbalance, balanceLevel, flowRatio } from '@/utils/balance'
+import type { Adjust, AdjustReadingSnapshot } from '@/types/adjust'
+import { buildAdjustReading, measureForReview } from '@/utils/balance'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -37,7 +37,39 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 导出调节单 CSV（含失衡度与流量比） */
+/** YYYY-MM-DD HH:mm（本地时区），CSV 时间列用 */
+function formatDateTime(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/**
+ * 由调节单与该阀实测解析两次口径：
+ * 基准直接读执行时快照；复测优先读复核时固化的快照，未复核则实时取执行后最新测次，
+ * 没有新测次时 review 为 null，绝不拿执行前旧读数顶替。
+ */
+function resolveAdjustReadings(
+  adjust: Adjust,
+  own: Measure[],
+  valve: Valve | undefined
+): {
+  baseline: AdjustReadingSnapshot | null
+  review: AdjustReadingSnapshot | null
+} {
+  const baseline = adjust.execSnapshot ?? null
+  if (adjust.reviewSnapshot) return { baseline, review: adjust.reviewSnapshot }
+  if (adjust.state !== '已调节' || typeof adjust.executedAt !== 'number' || !valve) {
+    return { baseline, review: null }
+  }
+  const reviewMeasure = measureForReview(own, adjust.executedAt)
+  return {
+    baseline,
+    review: reviewMeasure ? buildAdjustReading(reviewMeasure, valve.currentOpening, valve.designFlowM3h) : null
+  }
+}
+
+/** 导出调节单 CSV（执行基准与执行后复测两次口径并列） */
 export function exportAdjustCsv(
   stations: Station[],
   buildings: Building[],
@@ -45,6 +77,16 @@ export function exportAdjustCsv(
   measures: Measure[],
   adjusts: Adjust[]
 ): string {
+  const grouped = new Map<string, Measure[]>()
+  measures.forEach((measure) => {
+    const list = grouped.get(measure.valveId)
+    if (list) list.push(measure)
+    else grouped.set(measure.valveId, [measure])
+  })
+  grouped.forEach((list) =>
+    list.sort((a, b) => (a.date === b.date ? a.createdAt - b.createdAt : a.date.localeCompare(b.date)))
+  )
+
   const header = [
     '换热站',
     '楼栋',
@@ -53,12 +95,23 @@ export function exportAdjustCsv(
     '口径DN',
     '位置',
     '设计流量(m³/h)',
-    '实测流量(m³/h)',
-    '流量比',
-    '室温(℃)',
-    '失衡度(%)',
-    '判级',
-    '当前开度(%)',
+    '执行时间',
+    '基准开度(%)',
+    '基准实测日期',
+    '基准流量(m³/h)',
+    '基准室温(℃)',
+    '基准流量比',
+    '基准失衡度(%)',
+    '基准判级',
+    '复测时间',
+    '复测开度(%)',
+    '复测实测日期',
+    '复测流量(m³/h)',
+    '复测室温(℃)',
+    '复测流量比',
+    '复测失衡度(%)',
+    '复测判级',
+    '复测口径状态',
     '目标开度(%)',
     '调节依据',
     '执行人',
@@ -70,12 +123,17 @@ export function exportAdjustCsv(
     const valve = valves.find((item) => item.id === adjust.valveId)
     const building = valve ? buildings.find((item) => item.id === valve.buildingId) ?? null : null
     const station = building ? stations.find((item) => item.id === building.stationId) ?? null : null
-    const own = measures.filter((item) => item.valveId === adjust.valveId).sort((a, b) => a.date.localeCompare(b.date))
-    const latest = own[own.length - 1]
     const design = valve ? valve.designFlowM3h : 0
-    const measured = latest ? latest.flowM3h : 0
-    const room = latest ? latest.roomTempC : 0
-    const value = imbalance(measured, design, room)
+    const { baseline, review } = resolveAdjustReadings(adjust, grouped.get(adjust.valveId) ?? [], valve)
+    const reviewStatus =
+      adjust.state === '待下发'
+        ? '未执行'
+        : review
+          ? adjust.state === '已复核'
+            ? '复测已闭环'
+            : '已有新测次待复核'
+          : '执行后无新测次（复核被挡）'
+
     lines.push(
       [
         station ? station.name : '—',
@@ -85,12 +143,23 @@ export function exportAdjustCsv(
         valve ? valve.dn : '—',
         valve ? valve.position : '—',
         design,
-        latest ? measured : '—',
-        latest ? flowRatio(measured, design).toFixed(2) : '—',
-        latest ? room : '—',
-        value,
-        balanceLevel(value, measured, design),
-        valve ? valve.currentOpening : '—',
+        adjust.executedAt ? formatDateTime(adjust.executedAt) : '—',
+        baseline ? baseline.opening : '—',
+        baseline ? baseline.measureDate : '—',
+        baseline ? baseline.flowM3h : '—',
+        baseline ? baseline.roomTempC : '—',
+        baseline ? baseline.ratio.toFixed(2) : '—',
+        baseline ? baseline.imbalanceValue.toFixed(1) : '—',
+        baseline ? baseline.level : '—',
+        adjust.reviewedAt ? formatDateTime(adjust.reviewedAt) : '—',
+        review ? review.opening : '—',
+        review ? review.measureDate : '—',
+        review ? review.flowM3h : '—',
+        review ? review.roomTempC : '—',
+        review ? review.ratio.toFixed(2) : '—',
+        review ? review.imbalanceValue.toFixed(1) : '—',
+        review ? review.level : '—',
+        reviewStatus,
         adjust.targetOpening,
         adjust.basis,
         adjust.executor,
@@ -102,7 +171,7 @@ export function exportAdjustCsv(
     )
   })
   const filename = `调节单-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 
@@ -141,7 +210,7 @@ export function exportBalanceCsv(
     )
   })
   const filename = `失衡度排行-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

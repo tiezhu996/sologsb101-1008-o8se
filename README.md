@@ -79,7 +79,7 @@ sologsb101-1008/
 
 - **IndexedDB 库名**：`gbheatgrid`（Dexie 封装，`src/utils/db.ts`）
 - **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段）
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1)` → `version(2)` → `version(3)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段；v3 为调节单补「执行基准 + 执行后复测」两次口径快照）
 - **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单的互相引用数据；播种幂等
 - **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
@@ -101,3 +101,9 @@ npm run preview    # 本地预览构建产物
 - 合成失衡度 `= |流量偏差率| × 0.7 + |室温偏差| × 1.5`（单位 %）
 - 判级：`≤ 10%` 平衡，`10% ~ 25%` 偏大 / 偏小（按流量方向），`> 25%` 严重失衡
 - 目标开度建议 `= 当前开度 ÷ 流量比`，按 5% 取整并限制在 20% ~ 100%
+
+## 八、调节单两次口径（基准 / 复测）
+
+- **执行基准（执行时快照）**：状态由「待下发 → 已调节」当下，固化执行开度与当时最新实测的流量、室温，并记录 `executedAt`；同步把目标开度回写阀门台账。
+- **执行后复测（新测次）**：复核只认**执行时间之后**的实测（执行当天以实测录入时刻严格晚于执行时刻为准）；执行后没有新测次时，复核被挡住，旧读数不能冒充复测结果。复核当下把复测读数固化进 `reviewSnapshot` 并记录 `reviewedAt`。
+- 基准与复测两个快照随调节单持久化，**页面重开仍在**；调节单「状态详情」、导出 CSV（基准/复测两组列）与全量 JSON 备份均同时携带两次口径。
