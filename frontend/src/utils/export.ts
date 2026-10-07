@@ -37,7 +37,7 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 导出调节单 CSV（含失衡度与流量比） */
+/** 导出调节单 CSV（执行基准与复核复测两次口径分列） */
 export function exportAdjustCsv(
   stations: Station[],
   buildings: Building[],
@@ -53,29 +53,46 @@ export function exportAdjustCsv(
     '口径DN',
     '位置',
     '设计流量(m³/h)',
-    '实测流量(m³/h)',
-    '流量比',
-    '室温(℃)',
-    '失衡度(%)',
-    '判级',
-    '当前开度(%)',
     '目标开度(%)',
-    '调节依据',
     '执行人',
     '状态',
+    '执行时间',
+    '基准开度(%)',
+    '基准测次日期',
+    '基准流量(m³/h)',
+    '基准室温(℃)',
+    '基准流量比',
+    '基准失衡度(%)',
+    '基准判级',
+    '复测测次日期',
+    '复测开度(%)',
+    '复测流量(m³/h)',
+    '复测室温(℃)',
+    '复测流量比',
+    '复测失衡度(%)',
+    '复测判级',
+    '调节依据',
     '复核意见'
   ]
+  const formatDateTime = (ms: number | null): string =>
+    ms === null ? '—' : new Date(ms).toLocaleString('zh-CN', { hour12: false })
+  const num = (value: number | null): string | number => (value === null ? '—' : value)
+  const ratioText = (ratio: number, hasReading: boolean): string => (hasReading ? ratio.toFixed(2) : '—')
   const lines: string[] = [header.map(csvCell).join(',')]
   adjusts.forEach((adjust) => {
     const valve = valves.find((item) => item.id === adjust.valveId)
     const building = valve ? buildings.find((item) => item.id === valve.buildingId) ?? null : null
     const station = building ? stations.find((item) => item.id === building.stationId) ?? null : null
-    const own = measures.filter((item) => item.valveId === adjust.valveId).sort((a, b) => a.date.localeCompare(b.date))
-    const latest = own[own.length - 1]
     const design = valve ? valve.designFlowM3h : 0
-    const measured = latest ? latest.flowM3h : 0
-    const room = latest ? latest.roomTempC : 0
-    const value = imbalance(measured, design, room)
+    // 待下发尚未执行时，以当前最新实测预览一次「待执行基准」
+    const preview = (() => {
+      if (adjust.executionSnapshot) return null
+      const own = measures.filter((item) => item.valveId === adjust.valveId).sort((a, b) => a.date.localeCompare(b.date))
+      return own.length > 0 ? own[own.length - 1] : null
+    })()
+    const base = adjust.executionSnapshot
+    const retest = adjust.reviewSnapshot
+    const previewValue = preview ? imbalance(preview.flowM3h, design, preview.roomTempC) : 0
     lines.push(
       [
         station ? station.name : '—',
@@ -85,24 +102,33 @@ export function exportAdjustCsv(
         valve ? valve.dn : '—',
         valve ? valve.position : '—',
         design,
-        latest ? measured : '—',
-        latest ? flowRatio(measured, design).toFixed(2) : '—',
-        latest ? room : '—',
-        value,
-        balanceLevel(value, measured, design),
-        valve ? valve.currentOpening : '—',
         adjust.targetOpening,
-        adjust.basis,
         adjust.executor,
         adjust.state,
-        adjust.reviewNote
+        base ? formatDateTime(adjust.executedAt) : '—',
+        base ? base.opening : '—',
+        base ? base.date ?? '—' : preview ? preview.date : '—',
+        base ? num(base.flowM3h) : preview ? preview.flowM3h : '—',
+        base ? num(base.roomTempC) : preview ? preview.roomTempC : '—',
+        base ? ratioText(base.ratio, base.flowM3h !== null) : preview ? flowRatio(preview.flowM3h, design).toFixed(2) : '—',
+        base ? num(base.imbalanceValue) : preview ? previewValue : '—',
+        base ? base.level ?? '—' : preview ? balanceLevel(previewValue, preview.flowM3h, design) : '—',
+        retest ? retest.date ?? '—' : '—',
+        retest ? retest.opening : '—',
+        retest ? num(retest.flowM3h) : '—',
+        retest ? num(retest.roomTempC) : '—',
+        retest ? ratioText(retest.ratio, retest.flowM3h !== null) : '—',
+        retest ? num(retest.imbalanceValue) : '—',
+        retest ? retest.level ?? '—' : '—',
+        adjust.basis,
+        adjust.reviewNote || '—'
       ]
         .map(csvCell)
         .join(',')
     )
   })
   const filename = `调节单-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 
@@ -141,7 +167,7 @@ export function exportBalanceCsv(
     )
   })
   const filename = `失衡度排行-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

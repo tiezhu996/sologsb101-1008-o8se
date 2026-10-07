@@ -8,10 +8,11 @@ import type { Station } from '@/types/station'
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
-import type { Adjust } from '@/types/adjust'
+import type { Adjust, AdjustReadingSnapshot } from '@/types/adjust'
+import { balanceLevel, flowRatio, imbalance } from '@/utils/balance'
 
 export const DB_NAME = 'gbheatgrid'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbheatgrid:db-version',
@@ -68,7 +69,7 @@ class HeatGridDatabase extends Dexie {
     })
 
     // v2：阀门补 stationId 冗余列并在升级时回填；实测补 revision；调节单补 reviewNote
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, commissionYear, updatedAt',
         buildings: 'id, stationId, name, heatMode, updatedAt',
@@ -112,7 +113,127 @@ class HeatGridDatabase extends Dexie {
             }
           })
       })
+
+    // v3：调节单补执行时间、执行快照（基准口径）与复核快照（复测口径）
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, commissionYear, updatedAt',
+        buildings: 'id, stationId, name, heatMode, updatedAt',
+        valves: 'id, buildingId, stationId, code, position, updatedAt',
+        measures: 'id, valveId, date, operator, updatedAt',
+        adjusts: 'id, valveId, state, executor, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const valves = (await tx.table('valves').toArray()) as Array<{ id: string; designFlowM3h: number; currentOpening: number }>
+        const measures = (await tx
+          .table('measures')
+          .toArray()) as Array<{ id: string; valveId: string; date: string; flowM3h: number; supplyTempC: number; returnTempC: number; roomTempC: number; operator: string }>
+        const designOf = new Map(valves.map((item) => [item.id, item.designFlowM3h]))
+
+        const latestBefore = (valveId: string, boundary: number): (typeof measures)[number] | null => {
+          const own = measures
+            .filter((item) => item.valveId === valveId && item.date < new Date(boundary).toISOString().slice(0, 10))
+            .sort((a, b) => a.date.localeCompare(b.date))
+          return own.length > 0 ? own[own.length - 1] : null
+        }
+        const latestAfter = (valveId: string, boundary: number): (typeof measures)[number] | null => {
+          const own = measures
+            .filter((item) => item.valveId === valveId && item.date > new Date(boundary).toISOString().slice(0, 10))
+            .sort((a, b) => a.date.localeCompare(b.date))
+          return own.length > 0 ? own[own.length - 1] : null
+        }
+
+        await tx
+          .table('adjusts')
+          .toCollection()
+          .modify((adjust: Record<string, unknown>) => {
+            if (adjust.state === '待下发') return
+            const valveId = String(adjust.valveId ?? '')
+            const design = designOf.get(valveId) ?? 0
+            // 旧数据没有执行时间，以 updatedAt 作为执行时刻的最佳近似回填基准快照
+            const executedAt = typeof adjust.updatedAt === 'number' ? adjust.updatedAt : Date.now()
+            const baseMeasure = latestBefore(valveId, executedAt)
+            adjust.executedAt = executedAt
+            adjust.executionSnapshot = buildSnapshot(executedAt, Number(adjust.targetOpening ?? 0), baseMeasure, design)
+            if (adjust.state === '已复核') {
+              const reviewMeasure = latestAfter(valveId, executedAt)
+              adjust.reviewSnapshot = reviewMeasure ? buildSnapshot(executedAt, Number(adjust.targetOpening ?? 0), reviewMeasure, design) : null
+            } else {
+              adjust.reviewSnapshot = null
+            }
+          })
+      })
   }
+}
+
+/** 由开度与一条实测读数组装快照；无测次时仅固化开度（失衡度等留空） */
+function buildSnapshot(
+  capturedAt: number,
+  opening: number,
+  measure:
+    | {
+        id: string
+        date: string
+        flowM3h: number
+        supplyTempC: number
+        returnTempC: number
+        roomTempC: number
+        operator: string
+      }
+    | null,
+  designFlowM3h: number
+): AdjustReadingSnapshot {
+  if (!measure) {
+    return {
+      capturedAt,
+      opening,
+      measureId: null,
+      date: null,
+      flowM3h: null,
+      supplyTempC: null,
+      returnTempC: null,
+      roomTempC: null,
+      operator: null,
+      ratio: 0,
+      imbalanceValue: null,
+      level: null
+    }
+  }
+  const value = imbalance(measure.flowM3h, designFlowM3h, measure.roomTempC)
+  return {
+    capturedAt,
+    opening,
+    measureId: measure.id,
+    date: measure.date,
+    flowM3h: measure.flowM3h,
+    supplyTempC: measure.supplyTempC,
+    returnTempC: measure.returnTempC,
+    roomTempC: measure.roomTempC,
+    operator: measure.operator || null,
+    ratio: flowRatio(measure.flowM3h, designFlowM3h),
+    imbalanceValue: value,
+    level: balanceLevel(value, measure.flowM3h, designFlowM3h)
+  }
+}
+
+/** 供播种与状态机复用：按读数与设计流量组装执行 / 复核快照 */
+export function makeAdjustSnapshot(params: {
+  capturedAt: number
+  opening: number
+  measure:
+    | {
+        id: string
+        date: string
+        flowM3h: number
+        supplyTempC: number
+        returnTempC: number
+        roomTempC: number
+        operator: string
+      }
+    | null
+  designFlowM3h: number
+}): AdjustReadingSnapshot {
+  return buildSnapshot(params.capturedAt, params.opening, params.measure, params.designFlowM3h)
 }
 
 export const db = new HeatGridDatabase()
@@ -141,11 +262,11 @@ const SEED_BUILDINGS: BuildingRow[] = [
 ]
 
 const SEED_VALVES: ValveRow[] = [
-  { id: 'vv-1', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-01', dn: 65, currentOpening: 60, designFlowM3h: 32, position: '楼栋总阀', createdAt: stamp(-280), updatedAt: stamp(-2), revision: ROW_REVISION },
+  { id: 'vv-1', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-01', dn: 65, currentOpening: 55, designFlowM3h: 32, position: '楼栋总阀', createdAt: stamp(-280), updatedAt: stamp(-5), revision: ROW_REVISION },
   { id: 'vv-2', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-02', dn: 50, currentOpening: 45, designFlowM3h: 18, position: '单元立管', createdAt: stamp(-280), updatedAt: stamp(-2), revision: ROW_REVISION },
   { id: 'vv-3', buildingId: 'bd-2', stationId: 'st-1', code: 'BL-5-01', dn: 65, currentOpening: 75, designFlowM3h: 35, position: '楼栋总阀', createdAt: stamp(-279), updatedAt: stamp(-2), revision: ROW_REVISION },
   { id: 'vv-4', buildingId: 'bd-2', stationId: 'st-1', code: 'BL-5-02', dn: 50, currentOpening: 55, designFlowM3h: 20, position: '单元立管', createdAt: stamp(-279), updatedAt: stamp(-2), revision: ROW_REVISION },
-  { id: 'vv-5', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-01', dn: 50, currentOpening: 40, designFlowM3h: 22, position: '楼栋总阀', createdAt: stamp(-278), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'vv-5', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-01', dn: 50, currentOpening: 60, designFlowM3h: 22, position: '楼栋总阀', createdAt: stamp(-278), updatedAt: stamp(0), revision: ROW_REVISION },
   { id: 'vv-6', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-02', dn: 40, currentOpening: 35, designFlowM3h: 14, position: '单元立管', createdAt: stamp(-278), updatedAt: stamp(-3), revision: ROW_REVISION },
   { id: 'vv-7', buildingId: 'bd-4', stationId: 'st-2', code: 'BL-A-01', dn: 80, currentOpening: 85, designFlowM3h: 48, position: '楼栋总阀', createdAt: stamp(-260), updatedAt: stamp(-1), revision: ROW_REVISION },
   { id: 'vv-8', buildingId: 'bd-4', stationId: 'st-2', code: 'BL-A-02', dn: 50, currentOpening: 70, designFlowM3h: 22, position: '单元立管', createdAt: stamp(-260), updatedAt: stamp(-1), revision: ROW_REVISION },
@@ -180,7 +301,7 @@ function mkMeasure(
 
 const SEED_MEASURES: MeasureRow[] = [
   mkMeasure('ms-1-1', 'vv-1', -16, 17.8, 53, 41, 18.9, '王海'),
-  mkMeasure('ms-1-2', 'vv-1', -2, 18.6, 51, 39.5, 19.4, '王海'),
+  mkMeasure('ms-1-2', 'vv-1', -2, 30.7, 51, 39.5, 20.4, '王海'),
   mkMeasure('ms-2-1', 'vv-2', -16, 11.9, 53, 41, 20.3, '王海'),
   mkMeasure('ms-2-2', 'vv-2', -2, 12.4, 51, 39.5, 20.6, '王海'),
   mkMeasure('ms-3-1', 'vv-3', -15, 36.2, 52, 40, 20.4, '李强'),
@@ -201,11 +322,50 @@ const SEED_MEASURES: MeasureRow[] = [
   mkMeasure('ms-10-2', 'vv-10', -1, 22.6, 49, 37.5, 23.4, '王海')
 ]
 
+const SEED_MEASURE_BY_ID = new Map(SEED_MEASURES.map((item) => [item.id, item]))
+const SEED_VALVE_BY_ID = new Map(SEED_VALVES.map((item) => [item.id, item]))
+
+/** 播种用：以某条实测组装指定时刻、指定开度的读数快照 */
+function seedSnapshot(measureId: string, opening: number, capturedAt: number): AdjustReadingSnapshot {
+  const measure = SEED_MEASURE_BY_ID.get(measureId) ?? null
+  const valveId = measure?.valveId ?? ''
+  const design = SEED_VALVE_BY_ID.get(valveId)?.designFlowM3h ?? 0
+  return makeAdjustSnapshot({ capturedAt, opening, measure, designFlowM3h: design })
+}
+
 const SEED_ADJUSTS: AdjustRow[] = [
-  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
-  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
-  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
+  {
+    id: 'aj-1',
+    valveId: 'vv-1',
+    targetOpening: 55,
+    basis: '3号楼 BL-3-01 执行前流量比 0.56、室温 18.9℃，合成失衡度 32.7% 严重偏小，开度由 60% 调至 55% 后复测',
+    executor: '王海',
+    state: '已复核',
+    reviewNote: '复测（执行后新测次 2024-11-18）流量比回升至 0.96，室温 20.4℃，失衡度 3.4%，合格',
+    executedAt: stamp(-5),
+    executionSnapshot: seedSnapshot('ms-1-1', 55, stamp(-5)),
+    reviewSnapshot: seedSnapshot('ms-1-2', 55, stamp(-2)),
+    createdAt: stamp(-14),
+    updatedAt: stamp(-2),
+    revision: ROW_REVISION
+  },
+  {
+    id: 'aj-2',
+    valveId: 'vv-5',
+    targetOpening: 60,
+    basis: '7号楼 BL-7-01 执行时流量比 0.69、室温 19.0℃，合成失衡度 23.5% 偏小，开度由 40% 调至 60%，待执行后复测',
+    executor: '赵明',
+    state: '已调节',
+    reviewNote: '',
+    executedAt: stamp(0),
+    executionSnapshot: seedSnapshot('ms-5-2', 60, stamp(0)),
+    reviewSnapshot: null,
+    createdAt: stamp(-9),
+    updatedAt: stamp(0),
+    revision: ROW_REVISION
+  },
+  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', executedAt: null, executionSnapshot: null, reviewSnapshot: null, createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', executedAt: null, executionSnapshot: null, reviewSnapshot: null, createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
 ]
 
 export async function seedDatabase(): Promise<void> {
@@ -314,8 +474,43 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
     await db.buildings.bulkPut((payload.buildings ?? []).map(rev))
     await db.valves.bulkPut((payload.valves ?? []).map(rev))
     await db.measures.bulkPut((payload.measures ?? []).map(rev))
-    await db.adjusts.bulkPut((payload.adjusts ?? []).map(rev))
+    // 兼容旧版备份：缺执行 / 复核快照时按读数时间补齐，避免旧读数被当成复测
+    const valves = payload.valves ?? []
+    const measures = payload.measures ?? []
+    const designOf = new Map(valves.map((item) => [item.id, item.designFlowM3h]))
+    const normalizedAdjusts = (payload.adjusts ?? []).map((raw) => normalizeLegacyAdjust(raw, measures, designOf))
+    await db.adjusts.bulkPut(normalizedAdjusts.map(rev))
   })
+}
+
+/** 规整旧版调节单：补齐 executedAt / executionSnapshot / reviewSnapshot */
+function normalizeLegacyAdjust(
+  raw: Adjust,
+  measures: Measure[],
+  designOf: Map<string, number>
+): Adjust {
+  if (raw.state === '待下发' || (raw.executedAt !== null && raw.executedAt !== undefined && raw.executionSnapshot)) {
+    return {
+      ...raw,
+      executedAt: raw.executedAt ?? null,
+      executionSnapshot: raw.executionSnapshot ?? null,
+      reviewSnapshot: raw.reviewSnapshot ?? null
+    }
+  }
+  const executedAt = raw.executedAt ?? raw.updatedAt ?? Date.now()
+  const executedDate = new Date(executedAt).toISOString().slice(0, 10)
+  const own = measures.filter((item) => item.valveId === raw.valveId).sort((a, b) => a.date.localeCompare(b.date))
+  const baseMeasure = own.filter((item) => item.date <= executedDate).at(-1) ?? null
+  const reviewMeasure = raw.state === '已复核' ? own.filter((item) => item.date > executedDate).at(-1) ?? null : null
+  const design = designOf.get(raw.valveId) ?? 0
+  return {
+    ...raw,
+    executedAt,
+    executionSnapshot: makeAdjustSnapshot({ capturedAt: executedAt, opening: raw.targetOpening, measure: baseMeasure, designFlowM3h: design }),
+    reviewSnapshot: reviewMeasure
+      ? makeAdjustSnapshot({ capturedAt: executedAt, opening: raw.targetOpening, measure: reviewMeasure, designFlowM3h: design })
+      : null
+  }
 }
 
 export async function clearAllTables(): Promise<void> {
